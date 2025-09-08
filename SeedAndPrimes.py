@@ -14,7 +14,7 @@ from typing import Iterable, Tuple
 DEFAULT_KEY_BITS = 64    # Tamaño de la semilla S en bits
 DEFAULT_PRIME_BITS = 64  # Tamaño de los primos P y Q en bits
 DEFAULT_ID_BITS = 32     # Tamaño del identificador del nodo en bits
-DEFAULT_N_KEYS = 4       # Número de llaves a generar
+DEFAULT_N_KEYS = 16       # Número de llaves a generar
 
 # ---------------------------- Recolección de entropía ----------------------------
 
