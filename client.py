@@ -3,6 +3,18 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
 import time
+from PSN import encrypt_message, decrypt_message, extract_psn_from_plaintext_using_instruction
+from SeedAndPrimes import generate_prime, generate_seed, generate_node_id
+from KeyGenerator import generate_key_table
+from dataclasses import dataclass
+
+@dataclass
+class SharedParams:
+    id: int
+    P: int
+    Q: int
+    S: int
+    N: int = 16  # Número de llaves a generar
 
 class CryptographyClient:
     def __init__(self):
@@ -21,8 +33,22 @@ class CryptographyClient:
         self.host = "127.0.0.1"
         self.port = 65432
         
+        # Generar parámetros del cliente
+        self.node_id = generate_node_id(tag="client")
+        self.P = generate_prime(tag="client")  # Primo del cliente
+        self.S_client = generate_seed(tag="client")  # Semilla del cliente
+        
+        # Variables para el estado de cifrado
+        self.key_table = []
+        self.key_index = 0
+        self.next_psn = 0
+        self.next_extraction_instruction = None
+        
         # Crear la interfaz inicial
         self.create_initial_interface()
+        
+        # Configurar el cierre de la ventana
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
     def setup_styles(self):
         """Configurar estilos para una apariencia profesional"""
@@ -109,9 +135,46 @@ class CryptographyClient:
             self.client_socket.connect((self.host, self.port))
             self.connected = True
             
-            # Enviar mensaje inicial
-            initial_message = "First Message Contact"
-            self.client_socket.sendall(initial_message.encode())
+            # Enviar parámetros del cliente al servidor
+            client_params = f"{self.P},{self.S_client}"
+            self.client_socket.sendall(client_params.encode())
+            
+            # Recibir parámetros del servidor
+            server_params = self.client_socket.recv(1024).decode()
+            Q_server, S_server = map(int, server_params.split(','))
+            
+            # Calcular semilla compartida
+            S_shared = self.S_client ^ S_server
+            
+            # Crear parámetros compartidos
+            shared_params = SharedParams(
+                id=self.node_id,
+                P=self.P,
+                Q=Q_server,
+                S=S_shared
+            )
+            
+            # Generar tabla de claves
+            self.key_table = generate_key_table(shared_params)
+            self.key_index = 0
+            
+            # Enviar mensaje inicial encriptado
+            initial_message = b"First Message Contact"
+            key = self.key_table[self.key_index].to_bytes(8, 'big')
+            ciphertext = encrypt_message(initial_message, self.next_psn, key)
+            self.client_socket.sendall(ciphertext)
+            
+            # Recibir respuesta y actualizar el próximo PSN
+            response = self.client_socket.recv(2048)
+            result = decrypt_message(response, key)
+            
+            # Actualizar próximo PSN
+            self.next_psn = extract_psn_from_plaintext_using_instruction(
+                result["plaintext"], 
+                result["next_extraction_instruction"]
+            )
+            self.next_extraction_instruction = result["next_extraction_instruction"]
+            self.key_index = (self.key_index + 1) % len(self.key_table)
             
             # Cambiar a la interfaz de chat
             self.create_chat_interface()
@@ -228,8 +291,15 @@ class CryptographyClient:
             return
         
         try:
-            # Enviar mensaje al servidor
-            self.client_socket.sendall(message.encode())
+            # Obtener clave actual
+            key = self.key_table[self.key_index].to_bytes(8, 'big')
+            
+            # Encriptar mensaje
+            ciphertext = encrypt_message(message.encode(), self.next_psn, key)
+            self.client_socket.sendall(ciphertext)
+            
+            # Actualizar índice de clave
+            self.key_index = (self.key_index + 1) % len(self.key_table)
             
             # Agregar mensaje al chat
             self.add_message_to_chat("Tú", message, "#0078d4")
@@ -249,11 +319,33 @@ class CryptographyClient:
         """Recibir mensajes del servidor en un hilo separado"""
         while self.connected:
             try:
-                response = self.client_socket.recv(1024)
+                response = self.client_socket.recv(2048)
                 if response:
-                    message = response.decode()
-                    # Usar after() para actualizar la GUI desde el hilo principal
-                    self.root.after(0, lambda: self.add_message_to_chat("Servidor", message, "#ffb900"))
+                    # Verificar si es un mensaje broadcast (no encriptado)
+                    if response.startswith(b"[BROADCAST]"):
+                        message = response.decode()
+                        self.root.after(0, lambda msg=message: self.add_message_to_chat("Broadcast", msg, "#ff9900"))
+                        continue
+                    
+                    # Obtener clave actual
+                    key = self.key_table[self.key_index].to_bytes(8, 'big')
+                    
+                    # Desencriptar mensaje
+                    result = decrypt_message(response, key)
+                    message = result["plaintext"].decode()
+                    
+                    # Actualizar próximo PSN
+                    self.next_psn = extract_psn_from_plaintext_using_instruction(
+                        result["plaintext"], 
+                        result["next_extraction_instruction"]
+                    )
+                    self.next_extraction_instruction = result["next_extraction_instruction"]
+                    
+                    # Actualizar índice de clave
+                    self.key_index = (self.key_index + 1) % len(self.key_table)
+                    
+                    # Mostrar mensaje
+                    self.root.after(0, lambda msg=message: self.add_message_to_chat("Servidor", msg, "#ffb900"))
                 else:
                     break
             except Exception as e:
@@ -265,8 +357,18 @@ class CryptographyClient:
         """Desconectar del servidor"""
         if self.connected:
             try:
-                # Enviar mensaje de despedida
-                self.client_socket.sendall(b"Last Message Contact")
+                # Obtener clave actual
+                key = self.key_table[self.key_index].to_bytes(8, 'big')
+                
+                # Enviar mensaje de despedida encriptado
+                farewell_message = b"Last Message Contact"
+                ciphertext = encrypt_message(farewell_message, self.next_psn, key)
+                self.client_socket.sendall(ciphertext)
+                
+                # Recibir confirmación
+                response = self.client_socket.recv(2048)
+                result = decrypt_message(response, key)
+                message = result["plaintext"].decode()
                 
                 self.connected = False
                 if self.client_socket:
@@ -274,13 +376,19 @@ class CryptographyClient:
                 
                 # Actualizar estado
                 self.status_label.config(text="● Desconectado", foreground="#d13438")
-                self.add_message_to_chat("Sistema", "Conexión cerrada", "#d13438")
+                self.add_message_to_chat("Sistema", f"Conexión cerrada: {message}", "#d13438")
                 
                 # Mostrar mensaje y cerrar después de 2 segundos
                 self.root.after(2000, self.root.quit)
                 
             except Exception as e:
                 messagebox.showerror("Error", f"Error al desconectar: {str(e)}")
+    
+    def on_closing(self):
+        """Manejar el cierre de la ventana"""
+        if self.connected:
+            self.disconnect_from_server()
+        self.root.destroy()
     
     def run(self):
         """Ejecutar la aplicación"""

@@ -3,6 +3,18 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
 import time
+from PSN import encrypt_message, decrypt_message, extract_psn_from_plaintext_using_instruction
+from SeedAndPrimes import generate_prime, generate_seed, generate_node_id
+from KeyGenerator import generate_key_table
+from dataclasses import dataclass
+
+@dataclass
+class SharedParams:
+    id: int
+    P: int
+    Q: int
+    S: int
+    N: int = 16  # Número de llaves a generar
 
 class CryptographyServer:
     def __init__(self):
@@ -18,9 +30,15 @@ class CryptographyServer:
         # Variables
         self.server_socket = None
         self.clients = []  # Lista de conexiones de clientes
+        self.client_states = {}  # Almacenar estado por cliente (address -> (next_psn, next_instruction, key_table, key_index))
         self.running = False
         self.host = '127.0.0.1'
         self.port = 65432
+        
+        # Generar parámetros del servidor
+        self.node_id = generate_node_id(tag="server")
+        self.Q = generate_prime(tag="server")  # Primo del servidor
+        self.S_server = generate_seed(tag="server")  # Semilla del servidor
         
         # Crear la interfaz del servidor
         self.create_server_interface()
@@ -252,6 +270,7 @@ class CryptographyServer:
             except:
                 pass
         self.clients.clear()
+        self.client_states.clear()
         
         # Cerrar socket del servidor
         if self.server_socket:
@@ -276,9 +295,6 @@ class CryptographyServer:
                 client_socket, client_address = self.server_socket.accept()
                 self.clients.append((client_socket, client_address))
                 
-                self.root.after(0, lambda addr=client_address: self.add_log("Conexión", f"Cliente conectado desde {addr[0]}:{addr[1]}", "#0078d4"))
-                self.root.after(0, self.update_connections_count)
-                
                 # Iniciar hilo para manejar este cliente
                 client_thread = threading.Thread(target=self.handle_client, 
                                                args=(client_socket, client_address), 
@@ -293,27 +309,87 @@ class CryptographyServer:
     def handle_client(self, client_socket, client_address):
         """Manejar la comunicación con un cliente específico"""
         try:
+            # Recibir parámetros del cliente
+            params_data = client_socket.recv(1024).decode()
+            P_client, S_client = map(int, params_data.split(','))
+            
+            # Calcular semilla compartida
+            S_shared = self.S_server ^ S_client
+            
+            # Crear parámetros compartidos
+            shared_params = SharedParams(
+                id=self.node_id,
+                P=P_client,
+                Q=self.Q,
+                S=S_shared
+            )
+            
+            # Generar tabla de claves
+            key_table = generate_key_table(shared_params)
+            
+            # Almacenar estado del cliente
+            self.client_states[client_address] = {
+                'next_psn': 0,
+                'next_instruction': None,
+                'key_table': key_table,
+                'key_index': 0
+            }
+            
+            # Enviar parámetros del servidor al cliente
+            server_params = f"{self.Q},{self.S_server}"
+            client_socket.sendall(server_params.encode())
+            
+            self.root.after(0, lambda: self.add_log("Handshake", f"Parámetros intercambiados con {client_address[0]}", "#0078d4"))
+            
             while self.running:
-                data = client_socket.recv(1024)
+                data = client_socket.recv(2048)
                 if not data:
                     break
                 
-                message = data.decode()
-                
-                # Manejar mensajes especiales
-                if message == "First Message Contact":
-                    response = "Conexión establecida correctamente"
-                    self.root.after(0, lambda: self.add_log(f"Cliente {client_address[0]}", "Mensaje de contacto inicial recibido", "#0078d4"))
-                elif message == "Last Message Contact":
-                    response = "Desconexión confirmada"
-                    self.root.after(0, lambda: self.add_log(f"Cliente {client_address[0]}", "Mensaje de desconexión recibido", "#ffb900"))
-                    client_socket.sendall(response.encode())
-                    break
-                else:
-                    response = "Mensaje recibido correctamente"
-                    self.root.after(0, lambda msg=message: self.add_log(f"Cliente {client_address[0]}", f"Dice: {msg}", "#ffffff"))
-                
-                client_socket.sendall(response.encode())
+                try:
+                    # Obtener clave actual
+                    client_state = self.client_states[client_address]
+                    key_index = client_state['key_index']
+                    key = client_state['key_table'][key_index]
+                    
+                    # Desencriptar mensaje
+                    result = decrypt_message(data, key.to_bytes(8, 'big'))
+                    plaintext = result["plaintext"]
+                    message = plaintext.decode()
+                    
+                    # Actualizar estado del cliente
+                    current_instruction = result["next_extraction_instruction"]
+                    next_psn = extract_psn_from_plaintext_using_instruction(plaintext, current_instruction)
+                    client_state['next_psn'] = next_psn
+                    client_state['next_instruction'] = current_instruction
+                    client_state['key_index'] = (key_index + 1) % len(client_state['key_table'])
+                    
+                    # Manejar mensajes especiales
+                    if message == "First Message Contact":
+                        response = "Conexión establecida correctamente"
+                        self.root.after(0, lambda: self.add_log(f"Cliente {client_address[0]}", "Mensaje de contacto inicial recibido", "#0078d4"))
+                    elif message == "Last Message Contact":
+                        response = "Desconexión confirmada"
+                        self.root.after(0, lambda: self.add_log(f"Cliente {client_address[0]}", "Mensaje de desconexión recibido", "#ffb900"))
+                        # Enviar respuesta encriptada
+                        cipher_response = encrypt_message(response.encode(), client_state['next_psn'], key.to_bytes(8, 'big'))
+                        client_socket.sendall(cipher_response)
+                        break
+                    else:
+                        response = "Mensaje recibido correctamente"
+                        self.root.after(0, lambda msg=message: self.add_log(f"Cliente {client_address[0]}", f"Dice: {msg}", "#ffffff"))
+                    
+                    # Enviar respuesta encriptada
+                    cipher_response = encrypt_message(response.encode(), client_state['next_psn'], key.to_bytes(8, 'big'))
+                    client_socket.sendall(cipher_response)
+                    
+                except Exception as e:
+                    self.root.after(0, lambda: self.add_log("Error", f"Error procesando mensaje de {client_address[0]}: {str(e)}", "#d13438"))
+                    try:
+                        error_response = "Error procesando mensaje"
+                        client_socket.sendall(error_response.encode())
+                    except:
+                        pass
                 
         except Exception as e:
             if self.running:
@@ -322,6 +398,8 @@ class CryptographyServer:
             # Remover cliente de la lista
             try:
                 self.clients.remove((client_socket, client_address))
+                if client_address in self.client_states:
+                    del self.client_states[client_address]
                 client_socket.close()
                 self.root.after(0, lambda: self.add_log("Desconexión", f"Cliente {client_address[0]}:{client_address[1]} desconectado", "#ffb900"))
                 self.root.after(0, self.update_connections_count)
@@ -344,6 +422,7 @@ class CryptographyServer:
         
         for client_socket, client_address in self.clients:
             try:
+                # Enviar mensaje en texto plano (no encriptado para broadcast)
                 client_socket.sendall(f"[BROADCAST] {message}".encode())
                 sent_count += 1
             except:
@@ -353,6 +432,8 @@ class CryptographyServer:
         for client in disconnected_clients:
             try:
                 self.clients.remove(client)
+                if client[1] in self.client_states:
+                    del self.client_states[client[1]]
             except:
                 pass
         

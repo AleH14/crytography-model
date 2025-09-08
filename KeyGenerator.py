@@ -158,7 +158,7 @@ def generate_key_table(shared_params, n_keys: int = None):
         list[int]: lista de llaves generadas.
     """
     if n_keys is None:
-        n_keys = getattr(shared_params, "N", 4)
+        n_keys = getattr(shared_params, "N", 16)  # Cambiado a 16 por defecto
 
     P = int(shared_params.P)
     Q = int(shared_params.Q)
