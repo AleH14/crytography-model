@@ -3,6 +3,11 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
 import time
+from MessageType import Message
+import json
+from SeedAndPrimes import generate_prime, generate_seed, generate_node_id
+
+
 
 class CryptographyClient:
     def __init__(self):
@@ -11,6 +16,14 @@ class CryptographyClient:
         self.root.geometry("600x500")
         self.root.configure(bg='#2b2b2b')
         self.root.resizable(True, True)
+        self.node_id = generate_node_id(tag="cliente")
+        self.P = generate_prime(tag="cliente")
+        self.Q = generate_prime(tag="servidor")
+        self.S = generate_seed(tag="cliente")
+        self.N = 4  # Número de llaves
+
+
+
         
         # Configuración de estilo
         self.setup_styles()
@@ -109,10 +122,24 @@ class CryptographyClient:
             self.client_socket.connect((self.host, self.port))
             self.connected = True
             
-            # Enviar mensaje inicial
-            initial_message = "First Message Contact"
-            self.client_socket.sendall(initial_message.encode())
             
+            from SeedAndPrimes import generate_psn
+
+            psn = generate_psn(tag="inicio")
+
+            initial_msg = Message(
+                tipo="FCM",
+                contenido="Inicio de sesión segura",
+                psn=psn,
+                p=self.P,
+                s=self.S,
+                q=self.Q  # Asegúrate de que self.Q esté definido antes
+            )
+
+            payload = initial_msg.build()
+            serialized = json.dumps(payload)
+            self.client_socket.sendall(serialized.encode())
+
             # Cambiar a la interfaz de chat
             self.create_chat_interface()
             
@@ -158,6 +185,22 @@ class CryptographyClient:
                                      style='Disconnect.TButton',
                                      command=self.disconnect_from_server)
         disconnect_button.pack(side='right')
+
+        #Boton para enviar mensaje tipo KUM
+        kum_button = ttk.Button(header_frame,
+        text="KUM",
+        style='Send.TButton',
+        command=self.send_kum_message)
+        kum_button.pack(side='right', padx=(10, 0))
+
+        #Boton para enviar mensaje tipo LCM
+        lcm_button = ttk.Button(header_frame,
+        text="Cerrar sesión segura\n(LCM)",
+        style='Disconnect.TButton',
+        command=self.send_lcm_message)
+        lcm_button.pack(side='right', padx=(10, 0))
+
+
         
         # Área de mensajes
         self.chat_area = scrolledtext.ScrolledText(self.chat_frame,
@@ -219,27 +262,58 @@ class CryptographyClient:
         self.chat_area.see(tk.END)
     
     def send_message(self, event=None):
-        """Enviar mensaje al servidor"""
+        """Enviar mensaje cifrado al servidor"""
         if not self.connected:
             return
-            
+
         message = self.message_entry.get().strip()
         if not message:
             return
-        
+
         try:
+            
+            p = self.P
+            s = self.S
+            q = self.Q
+
+            from SeedAndPrimes import generate_psn
+            psn = generate_psn(tag="cliente")
+
+            # Construir mensaje tipo RM
+            msg_obj = Message(tipo="RM", contenido=message, psn=psn, p=p, s=s, q=q)
+            payload = msg_obj.build()
+            print("Mensaje construido:", payload)
+            serialized = json.dumps(payload)
+
             # Enviar mensaje al servidor
-            self.client_socket.sendall(message.encode())
-            
-            # Agregar mensaje al chat
+            self.client_socket.sendall(serialized.encode())
+
+            # Mostrar en el chat
             self.add_message_to_chat("Tú", message, "#0078d4")
-            
-            # Limpiar campo de entrada
             self.message_entry.delete(0, tk.END)
-            
+
         except Exception as e:
             self.add_message_to_chat("Error", f"No se pudo enviar el mensaje: {str(e)}", "#d13438")
-    
+    def send_kum_message(self):
+        """Enviar mensaje tipo KUM para solicitar actualización de llaves"""
+        from MessageType import Message
+        from SeedAndPrimes import generate_psn
+        import json
+
+        psn = generate_psn(tag="kum")
+        msg_obj = Message(tipo="KUM", contenido="Solicitud de actualización de llaves", psn=psn, p=self.P, s=self.S, q=self.Q)
+        payload = msg_obj.build()
+        self.client_socket.sendall(json.dumps(payload).encode())
+        self.add_message_to_chat("Tú", "KUM enviado", "#00b294")
+
+    def send_lcm_message(self):
+        """Enviar mensaje tipo LCM para cerrar sesión segura"""
+        psn = generate_psn(tag="lcm")
+        msg_obj = Message(tipo="LCM", contenido="Cierre de sesión", psn=psn, p=self.P, s=self.S, q=self.Q)
+        payload = msg_obj.build()
+        self.client_socket.sendall(json.dumps(payload).encode())
+        self.add_message_to_chat("Tú", "LCM enviado", "#d13438")
+        
     def start_receiving_thread(self):
         """Iniciar hilo para recibir mensajes del servidor"""
         receive_thread = threading.Thread(target=self.receive_messages, daemon=True)
@@ -258,6 +332,7 @@ class CryptographyClient:
                     break
             except Exception as e:
                 if self.connected:
+                    error_msg = f"Error recibiendo mensaje: {str(e)}"
                     self.root.after(0, lambda: self.add_message_to_chat("Error", f"Error recibiendo mensaje: {str(e)}", "#d13438"))
                 break
     

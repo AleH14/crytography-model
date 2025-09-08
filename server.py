@@ -316,8 +316,8 @@ class CryptographyServer:
                 client_socket.sendall(response.encode())
                 
         except Exception as e:
-            if self.running:
-                self.root.after(0, lambda: self.add_log("Error", f"Error con cliente {client_address[0]}: {str(e)}", "#d13438"))
+            error_msg = f"Error con cliente {client_address[0]}: {str(e)}"
+            self.root.after(0, lambda: self.add_log("Error", error_msg, "#d13438"))
         finally:
             # Remover cliente de la lista
             try:

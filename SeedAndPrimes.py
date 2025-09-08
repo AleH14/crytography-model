@@ -172,6 +172,12 @@ def generate_prime(bits: int = DEFAULT_PRIME_BITS, *, tag: str = "") -> int:
             candidate -= 2
         p = candidate
     return p
+def generate_psn(bits: int = 32, *, tag: str = "") -> int:
+    """
+    Genera un número de secuencia (PSN) de 32 bits.
+    Ideal para trazabilidad de mensajes en sistemas distribuidos.
+    """
+    return _int_from_entropy(bits, tag=f"psn|{tag}")
 
 # ---------------------------- Estructura compartida ----------------------------
 
