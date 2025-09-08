@@ -6,6 +6,7 @@ import time
 from PSN import encrypt_message, decrypt_message, extract_psn_from_plaintext_using_instruction
 from SeedAndPrimes import generate_prime, generate_seed, generate_node_id
 from KeyGenerator import generate_key_table
+from MessageTypes import MessageType, get_message_info, format_message_log
 from dataclasses import dataclass
 
 @dataclass
@@ -39,6 +40,10 @@ class CryptographyServer:
         self.node_id = generate_node_id(tag="server")
         self.Q = generate_prime(tag="server")  # Primo del servidor
         self.S_server = generate_seed(tag="server")  # Semilla del servidor
+        
+        # Variables para monitoreo visual
+        self.key_monitor_window = None
+        self.selected_client = None
         
         # Crear la interfaz del servidor
         self.create_server_interface()
@@ -138,7 +143,15 @@ class CryptographyServer:
                                     style='Stop.TButton',
                                     command=self.stop_server,
                                     state='disabled')
-        self.stop_button.pack(side='left')
+        self.stop_button.pack(side='left', padx=(0, 10))
+        
+        # Botón de monitoreo de llaves
+        self.monitor_button = ttk.Button(button_frame,
+                                       text="Monitor Llaves",
+                                       style='Start.TButton',
+                                       command=self.show_key_monitor,
+                                       state='disabled')
+        self.monitor_button.pack(side='left')
         
         # Información de conexiones
         connections_frame = tk.Frame(main_frame, bg='#2b2b2b')
@@ -247,6 +260,7 @@ class CryptographyServer:
             self.status_label.config(text="● Ejecutándose", foreground="#107c10")
             self.start_button.config(state='disabled')
             self.stop_button.config(state='normal')
+            self.monitor_button.config(state='normal')
             self.send_button.config(state='normal')
             
             self.add_log("Servidor", f"Servidor iniciado en {self.host}:{self.port}", "#107c10")
@@ -283,6 +297,7 @@ class CryptographyServer:
         self.status_label.config(text="● Detenido", foreground="#d13438")
         self.start_button.config(state='normal')
         self.stop_button.config(state='disabled')
+        self.monitor_button.config(state='disabled')
         self.send_button.config(state='disabled')
         self.update_connections_count()
         
@@ -303,12 +318,17 @@ class CryptographyServer:
                 
             except Exception as e:
                 if self.running:
-                    self.root.after(0, lambda: self.add_log("Error", f"Error aceptando conexión: {str(e)}", "#d13438"))
+                    error_msg = f"Error aceptando conexión: {str(e)}"
+                    self.root.after(0, lambda msg=error_msg: self.add_log("Error", msg, "#d13438"))
                 break
     
     def handle_client(self, client_socket, client_address):
         """Manejar la comunicación con un cliente específico"""
         try:
+            # Mostrar mensaje FCM
+            fcm_msg = format_message_log(MessageType.FCM, f"Recibiendo parámetros de {client_address[0]}")
+            self.root.after(0, lambda msg=fcm_msg: self.add_log("Sistema", msg, get_message_info(MessageType.FCM)["color"]))
+            
             # Recibir parámetros del cliente
             params_data = client_socket.recv(1024).decode()
             P_client, S_client = map(int, params_data.split(','))
@@ -332,14 +352,17 @@ class CryptographyServer:
                 'next_psn': 0,
                 'next_instruction': None,
                 'key_table': key_table,
-                'key_index': 0
+                'key_index': 0,
+                'key_regeneration_count': 0
             }
             
             # Enviar parámetros del servidor al cliente
             server_params = f"{self.Q},{self.S_server}"
             client_socket.sendall(server_params.encode())
             
-            self.root.after(0, lambda: self.add_log("Handshake", f"Parámetros intercambiados con {client_address[0]}", "#0078d4"))
+            # Confirmar FCM completado
+            fcm_complete = format_message_log(MessageType.FCM, f"Handshake completado con {client_address[0]}")
+            self.root.after(0, lambda msg=fcm_complete: self.add_log("Sistema", msg, get_message_info(MessageType.FCM)["color"]))
             
             while self.running:
                 data = client_socket.recv(2048)
@@ -347,44 +370,89 @@ class CryptographyServer:
                     break
                 
                 try:
-                    # Obtener clave actual
+                    # Verificar si es un mensaje en texto claro
+                    if data.startswith(b"[PLAINTEXT]"):
+                        message = data.decode()[11:]  # Remover prefijo [PLAINTEXT]
+                        response = "Mensaje en texto claro recibido correctamente"
+                        self.root.after(0, lambda msg=message: self.add_log(f"Cliente {client_address[0]} 🔓", f"Dice: {msg}", "#ff9900"))
+                        
+                        # Enviar respuesta en texto claro
+                        plaintext_response = f"[PLAINTEXT]{response}"
+                        client_socket.sendall(plaintext_response.encode())
+                        continue
+                    
+                    # Mensaje cifrado - procesar normalmente
                     client_state = self.client_states[client_address]
                     key_index = client_state['key_index']
                     key = client_state['key_table'][key_index]
+                    
+                    # Verificar si necesitamos regenerar llaves
+                    if key_index == 0 and client_state.get('key_regeneration_count', 0) > 0:
+                        kum_msg = format_message_log(MessageType.KUM, f"Cliente {client_address[0]} regeneró tabla de llaves (ciclo #{client_state['key_regeneration_count'] + 1})")
+                        self.root.after(0, lambda msg=kum_msg: self.add_log("Sistema", msg, get_message_info(MessageType.KUM)["color"]))
+                    
+                    # Mostrar mensaje RM
+                    rm_msg = format_message_log(MessageType.RM, f"Cliente {client_address[0]} - Llave K{key_index:02d}, PSN={client_state['next_psn']}")
+                    self.root.after(0, lambda msg=rm_msg: self.add_log("Sistema", msg, get_message_info(MessageType.RM)["color"]))
                     
                     # Desencriptar mensaje
                     result = decrypt_message(data, key.to_bytes(8, 'big'))
                     plaintext = result["plaintext"]
                     message = plaintext.decode()
                     
+                    # Debug: mostrar estado antes de actualizar
+                    old_psn = client_state['next_psn']
+                    debug_msg = f"Servidor antes: PSN={old_psn}, Key=K{key_index}, Mensaje='{message}'"
+                    self.root.after(0, lambda msg=debug_msg: self.add_log("Debug", msg, "#888888"))
+                    
                     # Actualizar estado del cliente
                     current_instruction = result["next_extraction_instruction"]
                     next_psn = extract_psn_from_plaintext_using_instruction(plaintext, current_instruction)
                     client_state['next_psn'] = next_psn
                     client_state['next_instruction'] = current_instruction
+                    old_key_index = key_index
                     client_state['key_index'] = (key_index + 1) % len(client_state['key_table'])
+                    
+                    # Debug: mostrar estado después de actualizar
+                    debug_msg2 = f"Servidor después: PSN {old_psn}→{next_psn}, Key K{old_key_index}→K{client_state['key_index']}"
+                    self.root.after(0, lambda msg=debug_msg2: self.add_log("Debug", msg, "#888888"))
+                    
+                    # Si volvemos al inicio, incrementar contador de regeneración
+                    if old_key_index == len(client_state['key_table']) - 1:
+                        client_state['key_regeneration_count'] = client_state.get('key_regeneration_count', 0) + 1
                     
                     # Manejar mensajes especiales
                     if message == "First Message Contact":
                         response = "Conexión establecida correctamente"
-                        self.root.after(0, lambda: self.add_log(f"Cliente {client_address[0]}", "Mensaje de contacto inicial recibido", "#0078d4"))
+                        self.root.after(0, lambda: self.add_log(f"Cliente {client_address[0]} 🔐", "Mensaje de contacto inicial recibido", "#0078d4"))
                     elif message == "Last Message Contact":
+                        # Mostrar mensaje LCM
+                        lcm_msg = format_message_log(MessageType.LCM, f"Cliente {client_address[0]} cerrando conexión")
+                        self.root.after(0, lambda msg=lcm_msg: self.add_log("Sistema", msg, get_message_info(MessageType.LCM)["color"]))
+                        
                         response = "Desconexión confirmada"
-                        self.root.after(0, lambda: self.add_log(f"Cliente {client_address[0]}", "Mensaje de desconexión recibido", "#ffb900"))
                         # Enviar respuesta encriptada
                         cipher_response = encrypt_message(response.encode(), client_state['next_psn'], key.to_bytes(8, 'big'))
                         client_socket.sendall(cipher_response)
+                        
+                        # Eliminar estado del cliente (LCM completado)
+                        if client_address in self.client_states:
+                            del self.client_states[client_address]
+                        
+                        lcm_complete = format_message_log(MessageType.LCM, f"Tabla de llaves de {client_address[0]} eliminada")
+                        self.root.after(0, lambda msg=lcm_complete: self.add_log("Sistema", msg, get_message_info(MessageType.LCM)["color"]))
                         break
                     else:
-                        response = "Mensaje recibido correctamente"
-                        self.root.after(0, lambda msg=message: self.add_log(f"Cliente {client_address[0]}", f"Dice: {msg}", "#ffffff"))
+                        response = "Mensaje cifrado recibido correctamente"
+                        self.root.after(0, lambda msg=message: self.add_log(f"Cliente {client_address[0]} 🔐", f"Dice: {msg}", "#ffffff"))
                     
                     # Enviar respuesta encriptada
                     cipher_response = encrypt_message(response.encode(), client_state['next_psn'], key.to_bytes(8, 'big'))
                     client_socket.sendall(cipher_response)
                     
                 except Exception as e:
-                    self.root.after(0, lambda: self.add_log("Error", f"Error procesando mensaje de {client_address[0]}: {str(e)}", "#d13438"))
+                    error_msg = f"Error procesando mensaje de {client_address[0]}: {str(e)}"
+                    self.root.after(0, lambda msg=error_msg: self.add_log("Error", msg, "#d13438"))
                     try:
                         error_response = "Error procesando mensaje"
                         client_socket.sendall(error_response.encode())
@@ -393,7 +461,8 @@ class CryptographyServer:
                 
         except Exception as e:
             if self.running:
-                self.root.after(0, lambda: self.add_log("Error", f"Error con cliente {client_address[0]}: {str(e)}", "#d13438"))
+                error_msg = f"Error con cliente {client_address[0]}: {str(e)}"
+                self.root.after(0, lambda msg=error_msg: self.add_log("Error", msg, "#d13438"))
         finally:
             # Remover cliente de la lista
             try:
@@ -441,8 +510,208 @@ class CryptographyServer:
         self.broadcast_entry.delete(0, tk.END)
         self.update_connections_count()
     
+    def show_key_monitor(self):
+        """Mostrar ventana de monitoreo de llaves"""
+        if not self.client_states:
+            messagebox.showinfo("Monitor de Llaves", "No hay clientes conectados para monitorear.")
+            return
+            
+        if self.key_monitor_window is not None and self.key_monitor_window.winfo_exists():
+            self.key_monitor_window.lift()
+            return
+        
+        self.key_monitor_window = tk.Toplevel(self.root)
+        self.key_monitor_window.title("🔑 Monitor de Llaves - Servidor")
+        self.key_monitor_window.geometry("700x600")
+        self.key_monitor_window.configure(bg='#2b2b2b')
+        
+        # Header
+        header_frame = tk.Frame(self.key_monitor_window, bg='#2b2b2b')
+        header_frame.pack(fill='x', padx=10, pady=10)
+        
+        title_label = tk.Label(header_frame,
+                              text="🔑 Monitor de Llaves - Servidor",
+                              font=('Arial', 16, 'bold'),
+                              fg='white',
+                              bg='#2b2b2b')
+        title_label.pack(side='left')
+        
+        # Selector de cliente
+        client_frame = tk.Frame(self.key_monitor_window, bg='#2b2b2b')
+        client_frame.pack(fill='x', padx=10, pady=(0, 10))
+        
+        tk.Label(client_frame,
+                text="Cliente:",
+                font=('Arial', 12, 'bold'),
+                fg='white',
+                bg='#2b2b2b').pack(side='left')
+        
+        self.client_var = tk.StringVar()
+        client_addresses = [f"{addr[0]}:{addr[1]}" for addr in self.client_states.keys()]
+        if client_addresses:
+            self.client_var.set(client_addresses[0])
+            self.selected_client = list(self.client_states.keys())[0]
+        
+        client_combo = ttk.Combobox(client_frame,
+                                   textvariable=self.client_var,
+                                   values=client_addresses,
+                                   state='readonly',
+                                   width=20)
+        client_combo.pack(side='left', padx=(10, 0))
+        client_combo.bind('<<ComboboxSelected>>', self.on_client_selected)
+        
+        # Información de sincronización
+        self.sync_frame = tk.Frame(self.key_monitor_window, bg='#2b2b2b')
+        self.sync_frame.pack(fill='x', padx=10, pady=(0, 10))
+        
+        self.current_key_label = tk.Label(self.sync_frame,
+                                         text="Llave Actual: K0",
+                                         font=('Arial', 12, 'bold'),
+                                         fg='#ffb900',
+                                         bg='#2b2b2b')
+        self.current_key_label.pack(side='left')
+        
+        self.psn_label = tk.Label(self.sync_frame,
+                                 text="PSN Actual: 0",
+                                 font=('Arial', 12, 'bold'),
+                                 fg='#0078d4',
+                                 bg='#2b2b2b')
+        self.psn_label.pack(side='right')
+        
+        # Frame principal con scroll
+        main_frame = tk.Frame(self.key_monitor_window, bg='#2b2b2b')
+        main_frame.pack(expand=True, fill='both', padx=10, pady=(0, 10))
+        
+        # Canvas y scrollbar para la lista de llaves
+        self.canvas = tk.Canvas(main_frame, bg='#1e1e1e', highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg='#1e1e1e')
+        
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Botón de actualizar
+        refresh_button = tk.Button(self.key_monitor_window,
+                                  text="🔄 Actualizar",
+                                  font=('Arial', 10, 'bold'),
+                                  fg='white',
+                                  bg='#0078d4',
+                                  command=self.refresh_server_key_monitor)
+        refresh_button.pack(pady=10)
+        
+        # Cargar datos iniciales
+        self.refresh_server_key_monitor()
+        
+        # Actualizar automáticamente cada segundo
+        self.update_server_key_monitor()
+    
+    def on_client_selected(self, event):
+        """Manejar selección de cliente"""
+        selected_text = self.client_var.get()
+        if selected_text:
+            ip, port = selected_text.split(':')
+            self.selected_client = (ip, int(port))
+            self.refresh_server_key_monitor()
+    
+    def refresh_server_key_monitor(self):
+        """Actualizar manualmente el monitor de llaves del servidor"""
+        if not self.selected_client or self.selected_client not in self.client_states:
+            return
+        
+        # Limpiar frame
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        
+        client_state = self.client_states[self.selected_client]
+        key_table = client_state['key_table']
+        key_index = client_state['key_index']
+        next_psn = client_state['next_psn']
+        
+        # Actualizar información de sincronización
+        self.current_key_label.config(text=f"Llave Actual: K{key_index}")
+        self.psn_label.config(text=f"PSN Actual: {next_psn}")
+        
+        # Lista de llaves
+        self.key_labels = []
+        for i, key in enumerate(key_table):
+            key_frame = tk.Frame(self.scrollable_frame, bg='#3c3c3c', relief='raised', bd=1)
+            key_frame.pack(fill='x', padx=5, pady=2)
+            
+            # Nombre de la llave
+            key_name = tk.Label(key_frame,
+                               text=f"K{i:02d}",
+                               font=('Consolas', 11, 'bold'),
+                               fg='white',
+                               bg='#3c3c3c',
+                               width=5)
+            key_name.pack(side='left', padx=10, pady=5)
+            
+            # Hash visual (primeros 8 caracteres del hash de la llave)
+            key_hash = hex(hash(key) & 0xFFFFFFFF)[2:].upper().zfill(8)
+            hash_label = tk.Label(key_frame,
+                                 text=f"Hash: {key_hash}",
+                                 font=('Consolas', 10),
+                                 fg='#cccccc',
+                                 bg='#3c3c3c')
+            hash_label.pack(side='left', padx=20)
+            
+            # Estado de la llave
+            if i == key_index:
+                status_text = '🎯 ACTUAL'
+                status_color = '#ffb900'
+                key_frame.config(bg='#4a4a00')  # Resaltar llave actual
+            elif i < key_index:
+                status_text = '✅ Usada'
+                status_color = '#888888'
+            else:
+                status_text = '🔑 Disponible'
+                status_color = '#107c10'
+            
+            status_label = tk.Label(key_frame,
+                                   text=status_text,
+                                   font=('Arial', 10, 'bold'),
+                                   fg=status_color,
+                                   bg=key_frame.cget('bg'))
+            status_label.pack(side='right', padx=10, pady=5)
+            
+            self.key_labels.append((key_frame, key_name, hash_label, status_label))
+    
+    def update_server_key_monitor(self):
+        """Actualizar automáticamente el estado del monitor de llaves del servidor"""
+        if self.key_monitor_window is None or not self.key_monitor_window.winfo_exists():
+            return
+        
+        try:
+            # Actualizar lista de clientes en el combobox
+            client_addresses = [f"{addr[0]}:{addr[1]}" for addr in self.client_states.keys()]
+            if hasattr(self, 'client_var'):
+                current_values = self.key_monitor_window.nametowidget('.!toplevel.!frame2.!combobox')['values']
+                if tuple(client_addresses) != current_values:
+                    self.key_monitor_window.nametowidget('.!toplevel.!frame2.!combobox')['values'] = client_addresses
+            
+            # Actualizar datos del cliente seleccionado
+            if self.selected_client and self.selected_client in self.client_states:
+                self.refresh_server_key_monitor()
+            
+            # Programar próxima actualización
+            self.key_monitor_window.after(1000, self.update_server_key_monitor)
+            
+        except Exception as e:
+            # Si hay error, probablemente la ventana se cerró
+            pass
+    
     def on_closing(self):
         """Manejar el cierre de la ventana"""
+        if self.key_monitor_window is not None and self.key_monitor_window.winfo_exists():
+            self.key_monitor_window.destroy()
         if self.running:
             self.stop_server()
         self.root.destroy()
